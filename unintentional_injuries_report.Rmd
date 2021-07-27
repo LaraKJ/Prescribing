@@ -1,0 +1,243 @@
+---
+title: "Age and Sex Differences in Hospital Admissions and Deaths from Unintentional Injuries in Scotland"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: word_document
+always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, dpi = 400)
+```
+
+```{r load_libraries}
+# Load libraries
+library(tidyverse)
+library(janitor)
+library(scales)
+library(ggthemes)
+```
+
+```{r load_raw_data}
+# Load raw data (available at https://www.opendata.nhs.scot/dataset/unintentional-injuries)
+admissions_raw_data <- read.csv("H:\\Data\\ui_admissions_2020.csv")
+deaths_raw_data <- read.csv("H:\\Data\\ui_deaths_2020.csv")
+hb_lookup <- read.csv("H:\\Data\\hb_lookup.csv")
+```
+
+# Overview
+
+This report summarises analysis done on hospital admissions and deaths in Scotland from unintentional injuries in response to two research questions:
+
+* What types of injures are most common and for which demographic (i.e., by age and sex)?
+* What is the rate of death in admissions of these injuries?
+
+# Data Processing
+
+Two open source datasets published by Public Health Scotland were used in this analysis:
+
+* Admissions, which provided information on emergency hospital admissions as a result of unintentional injuries (Source: SMR01)
+* Deaths, which provided information on deaths as a result of an unintentional injury (Source: NRS Deaths registrations)
+
+All information was aggregated at the level of year, health board, council area, injury location, injury type, age group and sex, with annual figures available for the period 2010 to 2018. Injuries in both datasets were categorised into 8 types: road traffic accidents; poisoning; falls; struck by, against; crushing, scalds; accidental exposure; and other. There was no patient identifiable information.
+
+This analysis focused on the most recent full year for which data was available (2018).
+
+
+```{r data_processing}
+# Process Data
+admissions <- admissions_raw_data %>%
+  # Join to hb_lookup to add Health Board names
+  left_join(hb_lookup, by = c("HBR" = "HB")) %>%
+  clean_names() %>% 
+  separate(financial_year, into = c("year", NA), sep = "/") %>% 
+  # Remove aggregate totals
+  filter(sex != "All",
+         age_group != "All",
+         injury_location != "All",
+         injury_type != "All Diagnoses",
+         # Filter to remove NAs in Health Board, as these are aggregate figures for all of Scotland
+         !is.na(hb_name)) %>%
+  # Change year variable to integer
+  mutate(year = as.integer(year),
+         age_group = as.factor(age_group)
+         ) %>%
+  # Remove superfluous columns
+  select(-c("hbrqf","caqf","age_group_qf", "sex_qf", "injury_location_qf","injury_type_qf", "hb_date_enacted", "hb_date_archived", "country")) %>%
+  # Number the rows
+  rowid_to_column() %>%
+  relocate("hb_name", .after = "hbr")
+
+# Reorder the factor levels for the Age Groups so they are chronological
+admissions$age_group <- fct_relevel(admissions$age_group, "5-9 years", after = 1)
+
+deaths <- deaths_raw_data %>%
+  # Join to hb_lookup to add Health Board names
+  left_join(hb_lookup, by = c("HBR" = "HB")) %>%
+  clean_names() %>%
+  # Remove data 2007 (not in admissions data)
+  filter(year != 2007,
+         # Remove aggregate totals
+         sex != "All",
+         age_group != "All",
+         injury_location != "All",
+         injury_type != "All",
+         # Filter to remove NAs in Health Board, as these are aggregate figures for all of Scotland
+         !is.na(hb_name)) %>%
+  # Remove superfluous columns
+  select(-c("hbrqf","caqf","age_group_qf", "sex_qf","injury_location_qf","injury_type_qf", "hb_date_enacted", "hb_date_archived", "country")) %>%
+  relocate("hb_name", .after = "hbr") %>%
+  mutate(age_group = as.factor(age_group))
+
+# Reorder the factor levels for the Age Groups so they are chronological
+deaths$age_group <- fct_relevel(deaths$age_group, "5-9 years", after = 1)
+
+# Rename categories so they match the spelling / capitalisation of the admissions data categories
+deaths$injury_type[deaths$injury_type == "Land transport accidents"] <- "RTA"
+deaths$injury_type[deaths$injury_type == "Accidental exposure"] <- "Accidental Exposure"
+deaths$injury_location[deaths$injury_location == "Not applicable"] <- "Not Applicable"
+```
+
+```{r data_summarising}
+#------------------------- Overall Totals -------------------------------#
+
+# Calculate total number of hospital admissions in Scotland by type of injury
+all_admissions_scotland <- admissions %>% filter(year == 2018) %>%
+  group_by(injury_type) %>%
+  summarise(number_of_injuries = sum(number_of_admissions)) %>%
+  arrange(desc(number_of_injuries))
+
+# Calculate total number of deaths in Scotland by type of injury
+all_deaths_scotland <- deaths %>% filter(year == 2018) %>%
+  group_by(injury_type) %>%
+  summarise(number_of_deaths = sum(number_of_deaths)) %>%
+  arrange(desc(number_of_deaths))
+
+# Join admissions and deaths data
+all_admissions_and_deaths_scotland <- all_admissions_scotland %>%
+  left_join(all_deaths_scotland) %>%
+  # Calculate the percentage of hospital admissions that result in deaths
+  mutate(rate_of_death = round(number_of_deaths / number_of_injuries,3),
+         `Rate of Death` = scales::percent(rate_of_death))
+all_admissions_and_deaths_scotland$injury_type[all_admissions_and_deaths_scotland$injury_type == "RTA"] <- "Road Traffic Accidents"
+
+#--------------- Break down totals by sex ---------------------------------#
+
+all_deaths_scotland_by_sex <- deaths %>% filter(year == 2018) %>%
+  group_by(injury_type, sex) %>%
+  summarise(number_of_deaths = sum(number_of_deaths)) %>%
+  pivot_wider(names_from = sex, values_from = number_of_deaths) %>%
+  mutate(total_deaths = sum(Female, Male)) %>%
+  rename(deaths_female = Female,
+         deaths_male = Male)
+
+all_admissions_and_deaths_scotland_by_sex <- admissions %>%
+  filter(year == 2018) %>%
+  group_by(injury_type, sex) %>%
+  summarise(number_of_injuries = sum(number_of_admissions)) %>%
+  pivot_wider(names_from = sex, values_from = number_of_injuries) %>%
+  mutate(total_admissions = sum(Female, Male)) %>%
+  rename(admissions_female = Female,
+         admissions_male = Male) %>%
+  left_join(all_deaths_scotland_by_sex) %>%
+  select(injury_type, total_admissions, total_deaths, admissions_female, admissions_male, deaths_female, deaths_male) %>%
+  arrange(desc(total_admissions), desc(total_deaths)) %>%
+  adorn_totals("row")
+all_admissions_and_deaths_scotland_by_sex$injury_type[all_admissions_and_deaths_scotland_by_sex$injury_type == "RTA"] <- "Road Traffic Accidents"
+
+
+#--------------- Break down admissions by sex and age group ----------------#
+
+admissions_scotland <- admissions %>% filter(year == 2018) %>% group_by(sex, age_group, injury_type) %>%
+  summarise(number_of_injuries = sum(number_of_admissions)) %>%
+  mutate(age_group_short = str_remove(age_group, " years"),
+         # Create a shorter version of the age group category (for prettier formatting)
+         age_group_short = as.factor(age_group_short))
+# Rename "75plus" factor level
+levels(admissions_scotland$age_group_short)[levels(admissions_scotland$age_group_short) == "75plus"] <- "75+"
+# Rename RTA to be more user friendly
+admissions_scotland$injury_type[admissions_scotland$injury_type == "RTA"] <- "Road Traffic Accidents"
+
+sex_differences <- all_admissions_and_deaths_scotland_by_sex %>%
+  mutate(sex_differences_admissions = round(admissions_male/admissions_female,1),
+         sex_differences_deaths = round(deaths_male/deaths_female,1),
+         # Replace Inf value with 0
+         sex_differences_deaths = ifelse(sex_differences_deaths == Inf, 0, sex_differences_deaths),
+         # Replace NA value with 0
+         sex_differences_deaths = replace_na(sex_differences_deaths, 0)
+         )
+
+# Deaths by Age Group and Sex
+
+deaths_by_age <- deaths_raw_data %>% filter(Sex != "All", InjuryType != "All", InjuryLocation != "All", Year == 2018, HBRQF != "d") %>%
+  group_by(AgeGroup, Sex) %>%
+  summarise(deaths = sum(NumberOfDeaths)) %>%
+  pivot_wider(names_from = Sex, values_from = deaths) %>%
+  mutate(AgeGroup = as.factor(AgeGroup),
+         Total = Female + Male)
+```
+
+
+# Results
+
+## Common Types of Injuries
+
+Across Scotland, there were `r comma(all_admissions_and_deaths_scotland_by_sex$total_admissions[all_admissions_and_deaths_scotland_by_sex$injury_type == "Total"])` admissions to hospital from unintentional injuries and assaults in 2018. Hospital admissions were evenly split between males(`r comma(all_admissions_and_deaths_scotland_by_sex$admissions_male[all_admissions_and_deaths_scotland_by_sex$injury_type == "Total"])`) and females (`r comma(all_admissions_and_deaths_scotland_by_sex$admissions_female[all_admissions_and_deaths_scotland_by_sex$injury_type == "Total"])`).
+
+Table 1 below shows that the most common types of injuries were `r all_admissions_scotland$injury_type[all_admissions_scotland$number_of_injuries == sort(all_admissions_scotland$number_of_injuries, decreasing = T)[1]]`, `r all_admissions_scotland$injury_type[all_admissions_scotland$number_of_injuries == sort(all_admissions_scotland$number_of_injuries, decreasing = T)[2]]` and `r all_admissions_scotland$injury_type[all_admissions_scotland$number_of_injuries == sort(all_admissions_scotland$number_of_injuries, decreasing = T)[3]]`. `r scales::percent(max(all_admissions_scotland$number_of_injuries) / sum(all_admissions_scotland$number_of_injuries))` of all hospital admissions were for `r all_admissions_scotland$injury_type[all_admissions_scotland$number_of_injuries == max(all_admissions_scotland$number_of_injuries)]`.  In terms of the male to female ratio, the biggest differences in hospital admissions between the sexes were for `r sex_differences$injury_type[sex_differences$sex_differences_admissions == max(sex_differences$sex_differences_admissions)]` (`r sex_differences$sex_differences_admissions[sex_differences$sex_differences_admissions == max(sex_differences$sex_differences_admissions)]` as many males as females).  Overall, men were more likely to be admitted to hospital for every type of injury except for `r sex_differences$injury_type[sex_differences$sex_differences_admissions < 1]`. However, in overall numbers, `r sex_differences$admissions_female[sex_differences$injury_type == "Falls"] - sex_differences$admissions_male[sex_differences$injury_type == "Falls"]` more females were admitted to hospital for falls. 
+
+```{r}
+# Table to show Number of Admissions and Deaths by Injury Type and broken down by sex
+sex_differences  %>%
+  mutate_at(c("total_admissions", "admissions_female", "admissions_male"), scales::comma) %>%
+  # Rename columns to be more easier to read
+  rename(`Type of Injury` = injury_type,
+         `Hospital Admissions (Total)` = total_admissions,
+         `Deaths (Total)` = total_deaths,
+         `Hospital Admissions (Female)` = admissions_female,
+         `Hospital Admissions (Male)` = admissions_male,
+         `Deaths (Female)` = deaths_female,
+         `Deaths (Male)` = deaths_male,
+         `Hospital Admissions (Male to Female Ratio)` = sex_differences_admissions,
+         `Deaths (Male to Female Ratio)` = sex_differences_deaths) %>%
+  knitr::kable(caption = "Table 1. Number of Hospital Admissions and Deaths by Injury Type in Scotland, 2018")
+```
+
+Figure 2 below shows the the number of hospital admissions for unintentional injuries across the lifespan. Falls increase the most with age, particularly for women above age 75. "Other" types of injuries also peak between age 25 and 64, with this change most pronounced for men.  The remaining types of injuries are more stable across the life span, except for a slight increase in the 25-45 age group for men.
+
+```{r}
+# Line chart (x axis = age group, y = number hospital admissions result in deaths, facet wrap for sex)
+ggplot(admissions_scotland)+
+  geom_line(aes(x = age_group_short, y = number_of_injuries, group = injury_type, colour = injury_type))+
+  facet_wrap(~sex, ncol = 2)+
+  scale_x_discrete(name = "Age Group (in Years)")+
+  scale_y_continuous(name = "Number of Hospital Admissions", labels = comma)+
+  theme_tufte()+
+  theme(legend.position = "bottom", legend.title = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1))+
+  labs(title = "Fig 2. Number of Hospital Admissions for \n Unintentional Injuries in Scotland, 2018",
+       caption = "Data Source: Public Health Scotland")
+```
+
+## Rates of Death
+
+In total there were `r all_admissions_and_deaths_scotland_by_sex$total_deaths[all_admissions_and_deaths_scotland_by_sex$injury_type == "Total"]` deaths from unintentional injuries in Scotland in 2018.  Men were `r sex_differences$sex_differences_deaths[sex_differences$injury_type == "Total"]` times more likely than women to death as a result of unintentional injuries. The only category of injury were women were more likely to die than men was for `r sex_differences$injury_type[sex_differences$sex_differences_deaths < 1 & sex_differences$sex_differences_deaths != 0]`.
+
+Children were least likely to die from unintentional injuries. In 2018, until 6 children under the age of 14 died. However, this rose to 87 people between 15-24 years old and 697 people aged 25-44.  Of all adults, 65-75 year olds were least likely to die (173 deaths), while those older than 75 were most likely to die (938 deaths).
+
+Figure 3 shows the rates of death for each type of injury. `r all_admissions_and_deaths_scotland$injury_type[all_admissions_and_deaths_scotland$rate_of_death == max(all_admissions_and_deaths_scotland$rate_of_death)]` had the highest rate of death at `r percent(all_admissions_and_deaths_scotland$rate_of_death[all_admissions_and_deaths_scotland$rate_of_death == max(all_admissions_and_deaths_scotland$rate_of_death)])`.
+
+```{r}
+# Bar chart of death rates by injury type
+ggplot(all_admissions_and_deaths_scotland)+
+  geom_col(aes(x = reorder(injury_type, + rate_of_death), y = rate_of_death, fill = injury_type), show.legend = F)+
+  geom_text(aes(x = reorder(injury_type, + rate_of_death), y = rate_of_death, label = `Rate of Death`), hjust = -.10)+
+  scale_y_continuous(name = "", labels = scales::percent_format(), limits = c(0, .40))+
+  scale_x_discrete(name = "")+
+  theme_tufte()+
+  theme(axis.text.x = element_blank(), axis.text.y = element_text(size = 12, hjust = 1), axis.ticks = element_blank())+
+  coord_flip()+
+  labs(title = "Fig 3. Rate of Date for Unintentional \n Injuries in Scotland, 2018",
+       caption = "Data Source: Public Health Scotland")
+```
+
+
+
