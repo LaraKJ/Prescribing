@@ -1,0 +1,657 @@
+---
+title: "Respiratory Report"
+output: 
+  flexdashboard::flex_dashboard:
+     theme: cosmo
+     orientation: rows
+     vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(readr)
+library(dplyr)
+library(dbplyr)
+library(lubridate)
+library(readxl)
+library(ggplot2)
+library(plotly)
+library(shiny)
+library(magrittr)
+library(stringr)
+library(flexdashboard)
+library(kableExtra)
+library(scales)
+library(tidyverse)
+```
+
+```{r data_loading, echo = F, message = F}
+#==============================================================#
+# Load Data
+#==============================================================#
+
+# Load Respiratory Data
+respiratory <- readRDS("N:/Data/rawData/activityData.rda") %>%
+  rename_with(snakecase::to_snake_case)
+
+#Load Montelukast data
+montelukast <- read.csv(file = 'N:/Data/Montelukast.csv') %>%
+  rename_with(snakecase::to_snake_case)
+
+# Load BNF chapter spend data
+bnf_spend <- read.csv(file = 'N:/Data/Spend_by_BNFchapter.csv') %>%
+  rename_with(snakecase::to_snake_case)
+
+#load a list of active GPs during the reporting period and map their localities
+source("N:/03-Reference/R Functions/loadPharmacyFunctions.R")
+
+#Load practice populations
+practiceLookup <- read_excel("N:\\03-Reference\\Lookup Information\\practice_information.xlsx") %>%
+  select(PracticeCode, practice_population, locality, cluster)
+
+# Load inhaler types
+inhaler_types <- read_excel("N:\\03-Reference\\Lookup Information\\DPI vs MDI inhalers.xlsx")
+```
+
+```{r data_processing, echo = F, message = F}
+#==============================================================#
+# Process Data
+#==============================================================#
+
+# Join prescribing data to practiceLookup to match on locality/cluster
+respiratory %<>% left_join(practiceLookup,
+                           by = c("presc_location_code" = "PracticeCode"))
+
+# Create objects for dates
+current_month <- max(respiratory$date)
+latest_date <- format.Date(current_month, "%B %Y")
+full_back12Mth <- format(as.Date(current_month) %m-% months(11), "%Y-%m-%d")
+full_back12Mth_pretty <- format(as.Date(current_month) %m-% months(11), "%B %Y")
+full_back3Mth <- format(as.Date(current_month) %m-% months(2), "%Y-%m-%d")
+full_back3Mth_pretty <- format(as.Date(current_month) %m-% months(2), "%B %Y")
+#full_current_month <- format(as.Date(current_month), "%B %Y")
+latest_full_quarter <- respiratory %>% group_by(fin_quarter) %>%
+  summarise(months_in_quarter = n_distinct(date)) %>%
+  filter(months_in_quarter == 3) %>%
+  filter(fin_quarter == max(fin_quarter)) %>% select(fin_quarter)
+latest_incomplete_quarter <- respiratory %>% group_by(fin_quarter) %>%
+  summarise(months_in_quarter = n_distinct(date)) %>%
+  filter(months_in_quarter < 3) %>% select(fin_quarter)
+
+# Change data classes for bnf spend
+bnf_spend %<>%
+  mutate(pd_paid_gic_excl_bb = as.numeric(gsub(",","", bnf_spend$pd_paid_gic_excl_bb)),
+         cost = paste(format(round(pd_paid_gic_excl_bb / 1e6,1), trim = T), "M"),
+         label = paste(pi_bnf_chapter_description, cost, sep = "\n"))
+```
+
+```{r data_summaries, echo = F, message = F}
+#==============================================================#
+# Summarise Data - High Level
+#==============================================================#
+
+# Number of respiratory patients in last 12 months
+total_respiratory_patients <- respiratory %>% filter(date >= full_back3Mth) %>%
+  summarise(patients = n_distinct(pat_upi_c))
+
+#------------------------------- Spend on Inhalers----------------------------#
+
+# Total spend on inhalers and number of inhalers prescribed in last 12 months in Lothian
+inhaler_spend <- respiratory %>% filter(date >= full_back12Mth) %>%
+  summarise(Cost = priceR::format_currency(sum(pd_paid_gic_excl_bb),"£"),
+            `Number of Items` = formattable::comma(round(sum(number_of_paid_items)),0),
+            `Quantity` = formattable::comma(round(sum(paid_quantity)),0))
+
+# Spend on inhalers by GP cluster - most recent 3 months
+respiratory_spend_bycluster <- respiratory %>% filter(date >= full_back3Mth, locality != "No HSCP Mapping Found", !is.na(locality)) %>%
+  group_by(cluster) %>%
+  summarise(respiratory_patients = n_distinct(pat_upi_c),
+            cost = sum(pd_paid_gic_excl_bb),
+            cost_per_treated_patient = cost / respiratory_patients)
+
+# Items and inhaler cost per treated patient by GP practice
+respiratory_bypractice <- respiratory %>% filter(date >= full_back3Mth, locality != "No HSCP Mapping Found", !is.na(locality)) %>%
+  group_by(cluster, presc_location_name) %>%
+  summarise(respiratory_patients = n_distinct(pat_upi_c),
+            cost = sum(pd_paid_gic_excl_bb),
+            cost_per_treated_patient = cost / respiratory_patients,
+            items = sum(number_of_paid_items),
+            items_per_treated_patient = items / respiratory_patients)
+
+#------------------------------------ SABA -----------------------------------#
+
+# Table summarising total patients, patients who have received a SABA,
+# patients who only received a SABA, patients who received an ICS inhaler, 
+#patients who only received an ICS
+single_saba_use <- respiratory %>% filter(date >= full_back12Mth) %>%
+  summarise(health_board = "NHS Lothian",
+            total_patients = n_distinct(pat_upi_c),
+            all_SABA_patients = n_distinct(pat_upi_c[respiratory$inhaler_class == "SABA"]),
+            only_SABA_patients = n_distinct(setdiff(pat_upi_c[respiratory$inhaler_class == "SABA"],
+                                                    pat_upi_c[respiratory$inhaler_class != "SABA"])),
+            all_ICS_patients = n_distinct(pat_upi_c[respiratory$inhaler_class %in% c("ICS", "ICS/LABA")]),
+            only_ICS_patients = n_distinct(setdiff(pat_upi_c[respiratory$inhaler_class %in% c("ICS", "ICS/LABA")], 
+                                                   pat_upi_c[respiratory$inhaler_class %in% c("LABA", "LAMA", "LAMA/LABA Mast Cell Stabaliser", "SABA", "SAMA", "Triple Therapy")]))
+  )
+# Broken down by cluster and practice
+single_saba_by_practice <- respiratory %>% filter(date >= full_back12Mth, !is.na(cluster), cluster != "No HSCP Mapping Found") %>%
+  group_by(cluster, presc_location_code, presc_location_name) %>%
+  summarise(#health_board = "NHS Lothian",
+    total_patients = n_distinct(pat_upi_c),
+    all_SABA_patients = n_distinct(pat_upi_c[respiratory$inhaler_class == "SABA"]),
+    only_SABA_patients = n_distinct(setdiff(pat_upi_c[respiratory$inhaler_class == "SABA"],
+                                            pat_upi_c[respiratory$inhaler_class != "SABA"])),
+    all_ICS_patients = n_distinct(pat_upi_c[respiratory$inhaler_class %in% c("ICS", "ICS/LABA")]),
+    only_ICS_patients = n_distinct(setdiff(pat_upi_c[respiratory$inhaler_class %in% c("ICS", "ICS/LABA")], 
+                                           pat_upi_c[respiratory$inhaler_class %in% c("LABA", "LAMA", "LAMA/LABA Mast Cell Stabaliser", "SABA", "SAMA", "Triple Therapy")]))
+  ) %>%
+  mutate(only_SABA_patients_percentage = round((only_SABA_patients/all_SABA_patients * 100),2)) %>%
+  arrange(desc(only_SABA_patients_percentage), desc(only_SABA_patients))
+
+# Percentage of patients prescribed > 12 SABA and > 6 SABA per annum
+SABAoveruse <- respiratory %>% filter(date >= full_back12Mth, str_detect(inhaler_class, "SABA"), locality != "No HSCP Mapping Found", !is.na(locality)) %>%
+  group_by(locality, presc_location_name, pat_upi_c) %>%
+  summarise(quantity = sum(adjusted_quantity)) %>%
+  mutate(overuse12_flag = ifelse(quantity > 12, 1, 0),
+         overuse6_flag = ifelse(quantity > 6, 1, 0)) %>%
+  ungroup() %>%
+  group_by(locality, presc_location_name) %>%
+  summarise(patients = n_distinct(pat_upi_c),
+            overuse12SABA = sum(overuse12_flag),
+            overuse6SABA = sum(overuse6_flag)) %>%
+  mutate(percent12 = round(overuse12SABA / patients * 100,2),
+         percent6 = round(overuse6SABA / patients * 100,2)) %>%
+  select(-patients) %>%
+  arrange(desc(percent12), desc(percent6))
+
+# Formatted table of SABA overuse
+SABAoveruse_formatted <- SABAoveruse %>%
+  rename(`Number of Patients > 12 SABA in last 12 months` = overuse12SABA,
+         `Number of Patients > 6 SABA in last 12 months` = overuse6SABA,
+         `Percent of Patients > 12 SABA in last 12 months` = percent12,
+         `Percent of Patients > 6 SABA in last 12 months` = percent6)
+
+# Grouping SABA overuse by year
+SABAoveruse_by_year <- respiratory %>% filter(str_detect(inhaler_class, "SABA"), locality != "No HSCP Mapping Found", !is.na(locality)) %>%
+  mutate(back12month = format(as.Date(date) %m-% months(11), "%Y-%m-%d")) %>%
+  group_by(fin_year, locality, presc_location_name, pat_upi_c) %>%
+  summarise(quantity = sum(adjusted_quantity)) %>%
+  mutate(overuse12_flag = ifelse(quantity > 12, 1, 0),
+         overuse6_flag = ifelse(quantity > 6, 1, 0)) %>%
+  ungroup() %>%
+  group_by(fin_year, locality, presc_location_name) %>%
+  summarise(patients = n_distinct(pat_upi_c),
+            overuse12SABA = sum(overuse12_flag),
+            overuse6SABA = sum(overuse6_flag)) %>%
+  mutate(percent12 = overuse12SABA / patients * 100,
+         percent6 = overuse6SABA / patients * 100)
+
+# Number of Patients on > 200 doses of SABA MDI (200 doses = 1 inhaler), broken down by practice
+SABAdoses <- respiratory %>% left_join(inhaler_types, by = "pi_bnf_item_description") %>% 
+  filter(str_detect(inhaler_class, "SABA"), locality != "No HSCP Mapping Found", !is.na(locality), 
+         date > full_back3Mth, 
+         saba_flag == "SABA",
+         category == "MDI") %>%
+  group_by(locality, presc_location_name) %>%
+  summarise(num_SABA_MDI_patients = n_distinct(pat_upi_c),
+            num_SABA_MDI_patients_rx_over200doses = n_distinct(pat_upi_c[adjusted_quantity >= 2]),
+            num_SABA_MDI_patients_rx_over300doses = n_distinct(pat_upi_c[adjusted_quantity >= 3]),
+            num_SABA_MDI_patients_rx_over400doses = n_distinct(pat_upi_c[adjusted_quantity >= 4])) %>%
+  mutate(percent = round(num_SABA_MDI_patients_rx_over200doses / num_SABA_MDI_patients, 2),
+         `Percentage of SABA MDI Prescriptions of more than 2 inhalers` = formattable::percent(percent)) %>%
+  select(-percent) %>%
+  arrange(desc(num_SABA_MDI_patients_rx_over200doses)) %>%
+  rename(`Number of Patients with a SABA MDI Prescription in last 3 months` = num_SABA_MDI_patients,
+         `Number of Patients with a Prescription of more than 2 SABA MDI Inhalers in last 3 months` = num_SABA_MDI_patients_rx_over200doses,
+         `Number of Patients with a Prescription of more than 3 SABA MDI Inhalers in last 3 months` = num_SABA_MDI_patients_rx_over300doses,
+         `Number of Patients with a Prescription of more than 4 SABA MDI Inhalers in last 3 months` = num_SABA_MDI_patients_rx_over400doses)
+
+#------------------ Percentage of ICS classified as high strength ----------------#
+
+# Summary of ICS high strength prescribing by practice since Jan 2018
+ics_prescribed <- respiratory %>% filter(date >= "2018-01-01", inhaler_class %in% c("ICS", "ICS/LABA", "Triple Therapy"), locality != "No HSCP Mapping Found", !is.na(locality)) %>%
+  group_by(fin_quarter, locality, presc_location_code, presc_location_name, inhaler_class, hscs_class) %>%
+  summarise(quantity = sum(adjusted_quantity)) %>%
+  mutate(highstrength_flag = ifelse(str_detect(hscs_class, "High"), "High", "Other")) %>%
+  ungroup() %>%
+  group_by(fin_quarter, locality, presc_location_code, presc_location_name) %>%
+  summarise(highstrengthquantity = sum(quantity[highstrength_flag == "High"]),
+            total_quantity = sum(quantity),
+            percent_highstrength = highstrengthquantity / total_quantity * 100) %>%
+  ungroup()
+
+# Formatted table of ICS prescribing by practice - last full Financial Quarter
+ics_table_formatted <- ics_prescribed %>% filter(fin_quarter %in% latest_full_quarter) %>%
+  mutate(percent_highstrength = round(percent_highstrength,2)) %>%
+  arrange(desc(percent_highstrength)) %>%
+  rename(`Quantity - High Strength ICS` = highstrengthquantity,
+         `Quantity - All ICS` = total_quantity,
+         `Percentage of ICS that is High Strength` = percent_highstrength) %>%
+  select(-fin_quarter)
+
+# Summary of ICS high strength prescribing - overall
+ics_totals <- ics_prescribed %>% group_by(fin_quarter) %>% 
+  summarise(total_quantity = sum(total_quantity),
+            highstrengthquantity = sum(highstrengthquantity),
+            percent_highstrength = highstrengthquantity / total_quantity * 100)
+
+ics_totals_longer <- ics_totals %>% rename(`All ICS` = total_quantity, `High Strength ICS` = highstrengthquantity) %>% 
+  pivot_longer(cols = c(`All ICS`, `High Strength ICS`), names_to = "group", values_to = "quantity")
+
+#------------ DPI vs MDI vs Soft Mist Inhaler Quantities over time---------------#
+
+# Quantity and Items by Inhaler Type by Quarter
+inhaler_types_by_quantity <- respiratory %>%
+  filter(pi_drug_formulation == "INHAL", !fin_quarter %in% latest_incomplete_quarter) %>%
+  left_join(inhaler_types, by = "pi_bnf_item_description") %>%
+  group_by(fin_quarter, category) %>%
+  summarise(quantity = sum(paid_quantity),
+            items = sum(number_of_paid_items))
+
+inhaler_types_by_percentage <- inhaler_types_by_quantity %>% select(-items) %>%
+  pivot_wider(names_from = category, values_from = quantity) %>%
+  mutate(total = DPI + MDI + `soft mist`,
+         `Percentage of DPI Inhalers` = scales::percent(DPI / total, accuracy = .1),
+         `Percentage of MDI Inhalers` = scales::percent(MDI / total, accuracy = .1),
+         `Percentage of Soft Mist Inhalers` = scales::percent(`soft mist` / total, accuracy = .1)) %>%
+  select(-c(total, DPI, MDI, `soft mist`)) %>%
+  rename(`Financial Quarter` = fin_quarter)
+
+# Extract list of inhalers to check
+# inhaler_caps_list <- respiratory %>% filter(date >= full_back12Mth) %>%
+#   filter(pi_drug_formulation == "CAPS") %>%
+#   left_join(inhaler_types, by = "pi_bnf_item_description") %>%
+#   group_by(inhaler_class, pi_approved_name, pi_prescribable_item_name, pi_bnf_item_description, pi_drug_formulation, category) %>% 
+#   summarise(quantity = sum(paid_quantity),
+#             items = sum(number_of_paid_items))
+
+#-------------------------------- Clenil to Soprobec Switch -------------------------------#
+
+# Summarise Soprobec and Clenil number of items from Jan 2020
+soprobec_clenil_summary <- respiratory %>% filter(str_detect(pi_prescribable_item_name, "CLENIL") | str_detect(pi_prescribable_item_name, "SOPROBEC"), date >= "2020-01-01") %>%
+  select(presc_location_name, pat_upi_c, date, pi_prescribable_item_name, pi_bnf_item_description, number_of_paid_items) %>% 
+  # Classify items as Clenil or Soprobec
+  mutate(class = case_when(
+    str_detect(pi_prescribable_item_name, "CLENIL") ~ "Clenil",
+    str_detect(pi_prescribable_item_name, "SOPROBEC") ~ "Soprobec"
+  )) %>%
+  group_by(date, class) %>%
+  summarise(items = sum(number_of_paid_items)) %>%
+  mutate(date = as.Date(date))
+
+# Summarise Soprobec and Clenil items by Age
+soprobec_clenil_summary_by_age <- respiratory %>% filter(str_detect(pi_prescribable_item_name, "CLENIL") | str_detect(pi_prescribable_item_name, "SOPROBEC"),
+                                                         date >= "2020-01-01", !is.na(pat_date_of_birth_c)) %>%
+  select(presc_location_name, pat_upi_c, pat_date_of_birth_c, date, pi_prescribable_item_name, pi_bnf_item_description, number_of_paid_items) %>%
+  mutate(prescribed_age = as.period(interval(start = pat_date_of_birth_c, end = date))$year,
+  class = case_when(
+    str_detect(pi_prescribable_item_name, "CLENIL") ~ "Clenil",
+    str_detect(pi_prescribable_item_name, "SOPROBEC") ~ "Soprobec"),
+  age_group = case_when(
+    prescribed_age < 18 ~ "Under 18",
+    prescribed_age >= 18 ~ "Over 18"
+  )) %>%
+  group_by(date, class, age_group) %>%
+  summarise(items = sum(number_of_paid_items))%>%
+  mutate(date = as.Date(date))
+
+#-------------------------------- Montelukast -------------------------------#
+
+# Montelukast - Items, Quantity and Cost by Month
+montelukast_summary <- montelukast %>% mutate(date = as.Date(paid_date, "%m/%d/%y")) %>%
+  group_by(date) %>%
+  summarise(items = sum(number_of_paid_items),
+            quantity = sum(paid_quantity),
+            cost = sum(pd_paid_gic_excl_bb),
+            patients = n_distinct(pat_upi_c))
+```
+
+# Summary
+
+## Row {data-height="100"}
+
+### Total Respiratory patients in last 12 months, `r full_back12Mth_pretty` - `r latest_date`
+
+```{r echo = F, message = F}
+valueBox(format(total_respiratory_patients$patients, big.mark = ","), icon = "fa-users")
+```
+
+
+## Row
+\ 
+Author: Lara Johnson, Senior Information Analyst
+
+Date: `r format(Sys.time(), '%d %B, %Y')` \
+
+\
+This report summarises inhaler prescribing trends in NHS Lothian.\
+\
+All prescribing data has been taken from the Prescribing Information System (PIS).\
+\
+[**Disclaimer: This file contains PIS data. The data presented have not been adjusted to protect against potential disclosure risks and are released for clinical and management information purposes. The data presented may contain information which enables (perhaps with the aid of further knowledge of the topic) an individual patient to be identified. Please ensure access is restricted and that patient confidentiality is not compromised.**]{style="color:red"}\
+
+# 1 - Spend
+
+Row {.tabset .tabset-fade} 
+-------------------------------------
+### 1.1 Spend by BNF Chapter
+```{r fig 1.1, echo = F, message = F}
+# Tree map of spend by BNF Chapter - last 12 months
+treemap::treemap(bnf_spend, index = "label", vSize = "pd_paid_gic_excl_bb", type = "index", 
+                 title = "Annual Spend by BNF Chapter")
+```
+
+### 1.2 Table - Spend on Inhalers in 12 Months
+```{r fig 1.2, echo = F, message = F}
+inhaler_spend %>% kbl() %>% kable_styling()
+```
+
+### 1.3 Bar Chart - Spend per Patient by Cluster
+```{r fig 1.3, echo = F, message = F}
+ggplot(respiratory_spend_bycluster)+
+  geom_bar(aes(x = cluster, y = cost_per_treated_patient, fill = cluster), stat = "identity", show.legend = F)+
+  geom_hline(aes(yintercept = mean(cost_per_treated_patient)))+
+  geom_text(aes(1.5, mean(cost_per_treated_patient), label = "Lothian Mean", vjust = -1))+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  scale_x_discrete(name = "")+
+  scale_y_continuous(name = "Cost per Treated Patient",labels = scales::dollar_format(prefix = "£"))+
+  labs(title = "Spend on inhalers by GP cluster", 
+       caption = paste(format(full_back3Mth_pretty), "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+```
+
+### 1.4 Scatterplot - Spend per Patient by Practice
+```{r fig 1.4, echo = F, message = F}
+ggplot(respiratory_bypractice)+
+  geom_point(aes(x = respiratory_patients, y = cost_per_treated_patient, colour = cluster), show.legend = F)+
+  geom_hline(aes(yintercept = mean(cost_per_treated_patient)))+
+  geom_text(aes(110, mean(cost_per_treated_patient), label = "Lothian Mean", vjust = -1))+
+  coord_cartesian(ylim = c(0,100))+
+  theme_minimal()+
+  scale_x_continuous(name = "Number of Treated Patients", breaks = seq(0,1500,100))+
+  scale_y_continuous(name = "Cost per Treated Patient",labels = scales::dollar_format(prefix = "£"))+
+  labs(title = "Spend on Inhalers - All Practices", 
+       caption = paste(format(full_back3Mth_pretty), "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+```
+
+### 1.5 Scatterplot - Items per Patient by Practice
+```{r fig 1.5, echo = F, message = F}
+# Items per treated patient
+ggplot(respiratory_bypractice)+
+  geom_point(aes(x = respiratory_patients, y = items_per_treated_patient, colour = cluster), show.legend = F)+
+  geom_hline(aes(yintercept = mean(items_per_treated_patient)))+
+  geom_text(aes(110, mean(items_per_treated_patient), label = "LothianMean", vjust = -1))+
+  theme_minimal()+
+  scale_x_continuous(name = "Number of Treated Patients", breaks = seq(0,1500,100))+
+  scale_y_continuous(name = "Items per Treated Patient")+
+  labs(title = "Number of Items - All Practices", 
+       caption = paste(format(full_back3Mth_pretty), "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+```
+
+
+# 2 - SABA Overuse
+
+Row {.tabset .tabset-fade} 
+-------------------------------------
+### 2.1 Table - Single SABA Use
+```{r fig 2.1, echo = F, message = F}
+single_saba_use %>% kbl() %>% kable_styling()
+```
+
+### 2.2 Table - Single SABA Use by Practice
+```{r fig 2.2, echo = F, message = F}
+DT::datatable(single_saba_by_practice, rownames = F, filter = 'top', class = 'cell-border stripe', editable = T)
+```
+
+### 2.3 Box Plot (> 12 SABA)
+```{r fig 2.3, echo = F, message = F}
+# Box Plot - % Patients Prescribed > 12 SABA per annum as a distribution by locality
+ggplot(SABAoveruse, aes(x = locality, y = percent12))+
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(alpha = .6, width = .15, aes(colour = locality), show.legend = F)+
+  geom_hline(aes(yintercept = mean(percent12), linetype = "Lothian Mean"), colour = "grey", size = 1.2)+
+  theme_minimal()+
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  scale_x_discrete(name = "")+
+  scale_y_continuous(name = "% Patients with > 12 SABA in 12 Months")+
+  labs(title = "Percentage of Patients Prescribed > 12 SABA per annum", 
+       caption = paste(format(full_back12Mth_pretty), "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+```
+
+### 2.4 Box Plot (>6 SABA)
+```{r fig 2.4, echo = F, message = F}
+# Percentage of patients prescribed > 6 SABA per annum
+ggplot(SABAoveruse, aes(x = locality, y = percent6))+
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(alpha = .6, width = .15, aes(colour = locality), show.legend = F)+
+  geom_hline(aes(yintercept = mean(percent6), linetype = "Lothian Mean"), colour = "grey", size = 1.2)+
+  theme_minimal()+
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  scale_x_discrete(name = "")+
+  scale_y_continuous(name = "% Patients with > 6 SABA in 12 Months")+
+  labs(title = "Percentage of Patients Prescribed > 6 SABA per annum", 
+       caption = paste(format(full_back12Mth_pretty), "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+```
+
+### 2.5 Table - SABA Overuse by Practice
+```{r fig 2.5, echo = F, message = F}
+# Table of SABA overuse by practices
+DT::datatable(SABAoveruse_formatted, rownames = F, filter = 'top', class = 'cell-border stripe', editable = T)
+```
+
+### 2.6 Run Chart (>12 SABA)
+```{r fig 2.6, echo = F, message = F}
+# Run chart of SABA overuse over time
+fig2_6 <- ggplot(SABAoveruse_by_year, aes(x = fin_year, y = percent12))+
+  geom_line(aes(group = presc_location_name, colour = locality))+
+  theme_minimal()+
+  theme(legend.position = "none")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  scale_x_discrete(name = "")+
+  scale_y_continuous(name = "% Patients with > 12 SABA in 12 Months")+
+  theme(axis.line = element_line(colour = "black"))+
+  facet_wrap(~locality)+
+  labs(title = "% Patients with > 12 SABA in 12 Months in NHS Lothian", 
+       caption = paste("January 2018", "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+
+ggplotly(fig2_6)
+```
+
+### 2.7 Run Chart (>6 SABA)
+```{r fig 2.7, echo = F, message = F}
+# Run chart of SABA overuse over time
+fig2_7 <- ggplot(SABAoveruse_by_year, aes(x = fin_year, y = percent6))+
+  geom_line(aes(group = presc_location_name, colour = locality))+
+  theme_minimal()+
+  theme(legend.position = "none")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  scale_x_discrete(name = "")+
+  scale_y_continuous(name = "% Patients with > 6 SABA in 12 Months")+
+  theme(axis.line = element_line(colour = "black"))+
+  facet_wrap(~locality)+
+  labs(title = "% Patients with > 6 SABA in 12 Months in NHS Lothian", 
+       caption = paste("January 2018", "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+
+ggplotly(fig2_7)
+```
+
+### 2.8 More than 2 SABA MDI per Prescription
+```{r fig 2.8, echo = F, message = F}
+# Number of Patients on > 200 doses of SABA MDI (200 doses = 1 inhaler), broken down by practice
+DT::datatable(SABAdoses, rownames = F, filter = 'top', class = 'cell-border stripe', editable = T, extensions = 'Buttons', 
+              options = list(dom = 'Blfrtip', buttons = c('copy', 'excel')))
+
+```
+
+
+
+
+# 3 - High Strength ICS
+
+Row {.tabset .tabset-fade} 
+-------------------------------------
+### 3.1 High Strength ICS - Last 3 Months
+```{r fig 3.1, echo = F, message = F}
+# Box plot of ICS percentage in most recent full quarter
+ggplot(ics_prescribed[ics_prescribed$fin_quarter %in% latest_full_quarter,], aes(x = locality, y = percent_highstrength))+
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(alpha = .6, width = .15, aes(colour = locality), show.legend = F)+
+  geom_hline(aes(yintercept = mean(percent_highstrength), linetype = "Lothian Mean"), colour = "grey", size = 1.2)+
+  theme_minimal()+
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  scale_x_discrete(name = "")+
+  scale_y_continuous(name = "% ICS Prescribed as High Strength per Practice")+
+  labs(title = "Percentage of ICS Classified as High Strength", 
+       caption = paste(format(full_back3Mth_pretty), "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+```
+
+### 3.2 Table - High Strength ICS by practice
+```{r fig 3.2, echo = F, message = F}
+DT::datatable(ics_table_formatted, rownames = F, filter = 'top', class = 'cell-border stripe', editable = T)
+```
+
+### 3.3 High Strength ICS Run Chart
+```{r fig 3.3, echo = F, message = F}
+# Time Series Trends
+# Fig 3.3 with bar chart on secondary axis
+ggplot(ics_totals_longer, aes(x = fin_quarter))+
+  geom_line(aes(y = percent_highstrength, group = 1))+
+  geom_col(aes(y = quantity / 10000, fill = group), position = "dodge")+
+  scale_y_continuous(name = "% ICS Prescribed as High Strength", labels = scales::percent_format(scale = 1),
+                     # Format secondary axis
+                     sec.axis = sec_axis(~. * 10000, name = "Quantity", labels = scales::comma))+
+  theme_minimal()+
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  scale_x_discrete(name = "")+
+  labs(title = "% of ICS Classified as High Strength in NHS Lothian", 
+     caption = paste("January 2018", "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+```
+
+
+# 4 - DPI & MDI Inhalers
+
+Row {.tabset .tabset-fade} 
+-------------------------------------
+
+### Fig 4.1 Quantity
+```{r fig 4.1, echo = F, message = F}
+# Quantity
+ggplot(inhaler_types_by_quantity)+
+  geom_line(aes(x = fin_quarter, y = quantity, group = category, colour = category))+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  scale_x_discrete(name = "")+
+  scale_y_continuous(name = "Quantity of Inhalers", labels = scales::comma)+
+  labs(title = "Quantity of DPI, MDI and Soft Mist Inhalers\n Prescribed Over Time", 
+       caption = paste("April 2016", "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+```
+
+### Fig 4.2 Items
+```{r fig 4.2, echo = F, message = F}
+# Number of Items
+ggplot(inhaler_types_by_quantity)+
+  geom_line(aes(x = fin_quarter, y = items, group = category, colour = category))+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  scale_x_discrete(name = "")+
+  scale_y_continuous(name = "Number of Items", labels = scales::comma)+
+  labs(title = "Number of Items of DPI, MDI and Soft Mist Inhalers\n Prescribed Over Time", 
+       caption = paste("April 2016", "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+```
+
+### Fig 4.3 Percentages
+```{r fig 4.3, echo = F, message = F}
+DT::datatable(inhaler_types_by_percentage, rownames = F, filter = 'top', class = 'cell-border stripe', editable = T)
+```
+
+
+# 5 - Clenil - Soprabec
+
+Row {.tabset .tabset-fade} 
+-------------------------------------
+
+### 5.1 Run Chart
+```{r fig 5.1, echo = F, message = F}
+# Run chart for Soprobec and Clenil number of items from Jan 2020
+ggplot(soprobec_clenil_summary)+
+  geom_line(aes(x = date, y = items, group = class, colour = class), size = 1)+
+  geom_vline(aes(xintercept = as.Date("2020-03-01")), linetype = "dashed", size = 1)+
+  annotate(geom = "text", x = as.Date("2020-01-22"), y = max(soprobec_clenil_summary$items), label = "Switch Start\n(Mar 2020)")+
+  theme_minimal()+
+  theme(panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank())+
+  scale_y_continuous(name = "Number of Prescriptions", labels = scales::comma)+
+  scale_x_date(name = " ")+
+  theme(legend.title = element_blank())+
+  labs(title = "Number of Clenil and Soprobec Items Prescribed", 
+       caption = paste(format(min(soprobec_clenil_summary$date, na.rm = T), "%B %Y"), "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+
+```
+
+### 5.2 Run Chart by Age
+```{r fig 5.2, echo = F, message = F}
+# Run chart for Soprobec and Clenil - Under vs Over 18s
+ggplot(soprobec_clenil_summary_by_age)+
+  geom_line(aes(x = date, y = items, group = class, colour = class), size = 1)+
+  geom_vline(aes(xintercept = as.Date("2020-03-01")), linetype = "dashed", size = 1)+
+  annotate(geom = "text", x = as.Date("2020-01-22"), y = max(soprobec_clenil_summary$items) - 4000, label = "Switch Start\n(Mar 2020)")+
+  theme_minimal()+
+  theme(panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank())+
+  scale_y_continuous(name = "Number of Prescriptions", labels = scales::comma)+
+  scale_x_date(name = " ")+
+  #theme(legend.title = element_blank())+
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~age_group, nrow = 2)+
+  labs(title = "Number of Clenil and Soprobec Items Prescribed by Age", 
+       caption = paste(format(min(soprobec_clenil_summary$date, na.rm = T), "%B %Y"), "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+
+```
+
+
+# 6 - Montelukast
+
+Row {.tabset .tabset-fade} 
+-------------------------------------
+### 6.1 Quantity
+```{r fig 6.1, echo = F, message = F}
+# Montelukast - run chart of prescribing quantity of all strengths of montelukast
+ggplot(montelukast_summary, aes(x = date))+
+  geom_line(aes(y = quantity), size = 1)+
+  geom_col(aes(y = patients * 30))+
+  scale_y_continuous(name = "Paid Quantity of Montelukast", labels = scales::comma,
+                     #Format secondary axis
+                     sec.axis = sec_axis(~. / 30, name = "Number of Patients", breaks = seq(0,3000, 500)))+
+  theme_minimal()+
+  scale_x_date(date_labels = "%b %Y", date_breaks = "3 months", name = " ")+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))+
+  labs(title = "Quantity of Montelukast Prescribed Over Time", 
+       caption = paste(format(min(montelukast_summary$date, na.rm = T), "%B %Y"), "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+
+```
+
+### 6.2 Spend on Montelukast
+```{r fig 6.2, echo = F, message = F}
+# Montelukast - run chart of cost
+ggplot(montelukast_summary, aes(x = date))+
+  geom_line(aes(y = cost), size = 1)+
+  geom_col(aes(y = patients * 3))+
+  scale_y_continuous(name = "Paid Cost of Montelukast (£)", labels = scales::comma,
+                     #Format secondary axis
+                     sec.axis = sec_axis(~. / 3, name = "Number of Patients", breaks = seq(0,3000, 500)))+
+  theme_minimal()+
+  scale_x_date(date_labels = "%b %Y", date_breaks = "3 months", name = " ")+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))+
+  labs(title = "Spend on Montelukast Prescribed Over Time", 
+       caption = paste(format(min(montelukast_summary$date, na.rm = T), "%B %Y"), "-", format(latest_date), sep = " ", "| NHS Lothian | Data Source: PIS"))
+
+```
+
+
+
+
+
