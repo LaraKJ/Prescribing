@@ -1,0 +1,383 @@
+---
+title: "Prescribing Indicators"
+author: "Lara"
+date: "19/01/2021"
+output: 
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+runtime: shiny
+---
+
+```{r setup, echo =FALSE}
+#knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(readr)
+library(dplyr)
+library(dbplyr)
+library(lubridate)
+library(readxl)
+library(ggplot2)
+library(plotly)
+library(shiny)
+library(magrittr)
+library(DT)
+```
+# Antibiotics
+```{r antibiotics, echo = F}
+#=============================================
+# Process the Antibiotics Dataset (for Indicators 1-3)
+#=============================================
+
+# Load in antibiotics dataset
+antibiotics <- fread("H:\\Training datasets\\Prescribing_indicators\\1-Antibiotics.csv")
+colnames(antibiotics) <- snakecase::to_snake_case(colnames(antibiotics)) #Rename columns
+# Change some strings to numeric and dates (be careful of century when converting 2-digit years to 4-digit years)
+antibiotics %<>% mutate(pat_date_of_birth_c = mdy(pat_date_of_birth_c),
+                        pat_date_of_birth_c = ifelse(year(pat_date_of_birth_c) > 2021,
+                                                     paste(subtract((year(pat_date_of_birth_c)), 100),
+                                                           format(pat_date_of_birth_c, "%m-%d"),
+                                                           sep = "-"),
+                                                     as.character(pat_date_of_birth_c)),
+                        pat_date_of_birth_c = as.POSIXct(pat_date_of_birth_c),
+                        paid_date = as.POSIXct(paid_date, format = "%m/%d/%y"),
+                        paid_quantity = as.numeric(gsub(",", "", paid_quantity)),
+                        pd_paid_gic_excl_bb = as.numeric(gsub(",", "", pd_paid_gic_excl_bb)),
+                        paid_month_year = zoo::as.yearmon(paid_date, "%b %Y"),
+                        paid_financial_quarter = case_when(
+                          paid_date >= "2019-10-01" & paid_date <= "2019-12-31" ~ "Q3 19/20",
+                          paid_date >= "2020-01-01" & paid_date <= "2020-03-31" ~ "Q4 19/20",
+                          paid_date >= "2020-04-01" & paid_date <= "2020-06-30" ~ "Q1 20/21",
+                          paid_date >= "2020-07-01" & paid_date <= "2020-09-30" ~ "Q2 20/21",
+                          paid_date >= "2020-10-01" & paid_date <= "2020-12-31" ~ "Q3 20/21",
+                          paid_date >= "2021-01-01" & paid_date <= "2021-03-31" ~ "Q4 20/21")
+                        )
+
+#Load a list of active GPs during the reporting period and map their localities / clusters
+source("N:/Projects/Primary Care Pharmacy/Tips and Training/R/loadPharmacyFunctions.R")
+
+practices <- antibiotics %>% select(presc_location_code) %>% distinct()
+practiceLookup <- searchLookupFile(practiceCode = practices$presc_location_code) %>%
+  select(PracticeCode, locality, cluster)
+
+# Add practice population (as of Jan 2020)
+practice_population <- read_excel("H:\\Training datasets\\Practice_pop_2021-01-15.xlsx")
+practice_population %<>% select(LOCATION_CODE, PRACTICE_POPULATION)
+colnames(practice_population) <- snakecase::to_snake_case(colnames(practice_population))
+
+practiceLookup %<>% left_join(practice_population, by = c("PracticeCode" = "location_code"))
+
+# Add column of real practice list size and population by age bands TO DO
+# Connect to TRAK and run SQL file
+
+
+#Use the gpLookup file to match on locality/cluster
+antibiotics %<>% left_join(practiceLookup,
+                              by = c("presc_location_code" = "PracticeCode"))
+
+# Remove NAs from locality and practice_population
+antibiotics %<>% filter(!is.na(locality), !is.na(practice_population), locality != "No HSCP Mapping Found")
+```
+
+# Indicator 1 - Antibiotic Items per 1000 list size per day ≤ 1.64
+```{r indicator 1, echo = F}
+#knitr::opts_chunk$set(echo = TRUE)
+# Indicator 1 - summarise by financial quarter
+indicator1_byquarter <- antibiotics %>% group_by(locality, cluster, presc_location_code, presc_location_name, practice_population, paid_financial_quarter) %>%
+  summarise(antibiotics_items = sum(number_of_paid_items)) %>%
+  mutate(items_per_1000_listsize = round((antibiotics_items*1000)/practice_population,2),
+         items_per_1000_listsize_perday = round(items_per_1000_listsize/(365/4),2),
+         target = 1.64,
+         target_met = if_else(items_per_1000_listsize_perday <= target, "Yes", "No"))
+
+# Indicator 1 - summarise by month
+indicator1_bymonth <- antibiotics %>% group_by(locality, cluster, presc_location_code, presc_location_name, practice_population, paid_financial_quarter, paid_month_year, paid_date) %>%
+  summarise(antibiotics_items = sum(number_of_paid_items)) %>%
+  mutate(items_per_1000_listsize = round((antibiotics_items*1000)/practice_population,2),
+         items_per_1000_listsize_perday = round(items_per_1000_listsize/(365/12),2),
+         target = 1.64,
+         target_met = if_else(items_per_1000_listsize_perday <= target, "Yes", "No"))
+
+# Extract baseline figures
+ind1_baseline <- indicator1_byquarter %>% filter(paid_financial_quarter == "Q3 19/20") %>% 
+  select(presc_location_code, presc_location_name, items_per_1000_listsize_perday)
+ind1_baseline$baseline <- ind1_baseline$items_per_1000_listsize_perday
+ind1_baseline <- ind1_baseline[,c(4,7)]
+
+# Locality means by month
+ind1_localitymeans <- indicator1_bymonth %>% group_by(locality, paid_date, paid_month_year, target) %>%
+  summarise_at(vars(items_per_1000_listsize_perday), list(localitymean = mean))  %>%
+  mutate(localitymean = round(localitymean, 2))
+
+# Locality means by quarter
+ind1_localitymeans_byquarter <- indicator1_byquarter %>% group_by(locality, paid_financial_quarter, target) %>%
+  summarise_at(vars(items_per_1000_listsize_perday), list(localitymean = mean))  %>%
+  mutate(localitymean = round(localitymean, 2))
+
+```
+
+## Table
+```{r echo = F}
+inputPanel(
+  selectInput("quarter3", label = "Select a quarter:",
+              choices = c(indicator1_byquarter$paid_financial_quarter %>% unique())
+                ))
+  DT::renderDataTable({
+    indicator1_byquarter %>% filter(paid_financial_quarter == input$quarter3) %>%
+      select(!c(paid_financial_quarter, items_per_1000_listsize, target)) %>%
+      left_join(ind1_baseline, by = "presc_location_code") %>%
+      # Add columns for practice baseline and % change since baseline
+  mutate(baseline_change = items_per_1000_listsize_perday - baseline,
+         percentage_change = round(baseline_change / baseline,2)) 
+    }, rownames = F, filter = "top",
+  colnames = c("Locality", "Cluster", "Location Code", "Location Name", "Practice Population", "Items Prescribed", "Items per 1000 List Size Per Day", "Target Met", "Baseline", "Change from Baseline", "Percentage Reduction"),
+    extensions = 'Buttons', options = list(dom = 'Bfrtrip', buttons = c('copy', 'excel','csv', 'pdf'))
+)
+```
+
+## Bar Chart
+### Antibiotics Items Prescribed by Practice by Quarter 
+```{r table, echo = F}
+inputPanel(
+# Selector for choosing locality
+  selectInput("locality", label = "Choose a locality:",
+              choices = c("East Lothian", "Midlothian", "North East Edinburgh", "North West Edinburgh", "South East Edinburgh", "South West Edinburgh", "West Lothian")),
+# Selector for choosing quarter
+  selectInput("quarter", label = "Choose a quarter:",
+              choices = c(indicator1_byquarter$paid_financial_quarter %>% unique())
+))
+
+renderPlot({
+  ggplot(indicator1_byquarter[indicator1_byquarter$locality == input$locality & indicator1_byquarter$paid_financial_quarter == input$quarter,])+
+  geom_bar(aes(x = reorder(presc_location_name, items_per_1000_listsize_perday), y = items_per_1000_listsize_perday, fill = target_met), stat = "identity")+
+  geom_hline(aes(yintercept = target, linetype = "Target (1.64)"))+
+  geom_hline(aes(yintercept = mean(items_per_1000_listsize_perday), linetype = "Locality Mean"))+
+  scale_fill_discrete(name = "Target Met?", breaks = c("No", "Yes"))+
+  scale_x_discrete(name = "")+
+  scale_y_continuous(name = "Antibiotics Items Prescribed Per 1000 List Size")+
+  theme_minimal()+
+  coord_flip()
+})
+
+```
+
+## Trends Over Time
+### Means per Locality by Quarter
+```{r timeseries, echo = F}
+# Time Series - Overview of All Localities
+ggplot(ind1_localitymeans)+
+  geom_line(aes(x = paid_date, y = localitymean, colour = locality))+
+  geom_hline(aes(yintercept = target))+
+  annotate("text", min(ind1_localitymeans$paid_date), 1.64, vjust = -.5, label = "Target")+
+  scale_y_continuous(name = "Locality Mean")+
+  theme_minimal()
+```
+
+### Table of Locality Means by Quarter
+```{r echo = F}
+inputPanel(
+  selectInput("ind1_quarter2", label = "Select a quarter:",
+              choices = c(ind1_localitymeans_byquarter$paid_financial_quarter %>% unique())
+                ))
+  DT::renderDataTable({
+    ind1_localitymeans_byquarter[ind1_localitymeans_byquarter$paid_financial_quarter == input$ind1_quarter2,]}, rownames = F, filter = "top", 
+             colnames = c("Locality", "Paid Financial Quarter", "Target", "Locality Mean"),
+    extensions = 'Buttons', options = list(dom = 'Bfrtrip', buttons = c('copy', 'excel','csv', 'pdf'))
+)
+
+```
+
+### All Practices Within a Locality Over Time
+```{r timeseries_locality, echo = F}
+inputPanel(
+# Selector for choosing locality
+  selectInput("locality2", label = "Choose a locality:",
+              choices = c("East Lothian", "Midlothian", "North East Edinburgh", "North West Edinburgh", "South East Edinburgh", "South West Edinburgh", "West Lothian"))
+)
+
+renderPlot({
+  ggplot(indicator1_bymonth[indicator1_bymonth$locality == input$locality2,])+
+  geom_line(aes(x = paid_date, y = items_per_1000_listsize_perday, group = presc_location_name, colour = presc_location_name), alpha = .7)+
+  geom_hline(aes(yintercept = target))+
+  annotate("text", min(ind1_localitymeans$paid_date), 1.64, vjust = -.5, label = "Target")+
+  geom_line(data = ind1_localitymeans[ind1_localitymeans$locality == input$locality2,], aes(x = paid_date, y = localitymean), colour = "darkred", size = 2)+
+  scale_y_continuous(name = "Antibiotics Items Prescribed Per 1000 List Size")+
+  theme_minimal()
+})
+```
+
+### Individual Practices Over Time
+```{r timeseries_practices, echo = F}
+inputPanel(
+# Selector for choosing locality
+  selectInput("locality3", label = "Choose a Practice:",
+              choices = c(indicator1_bymonth$presc_location_name %>% sort() %>% unique())
+))
+
+renderPlot({
+  ggplot(indicator1_bymonth[indicator1_bymonth$presc_location_name == input$locality3,])+
+  geom_line(aes(x = paid_date, y = items_per_1000_listsize_perday, colour = presc_location_name))+
+  geom_hline(aes(yintercept = target))+
+  annotate("text", min(ind1_localitymeans$paid_date), 1.64, vjust = -.5, label = "Target")+
+  geom_line(data = ind1_localitymeans[ind1_localitymeans$locality == indicator1_bymonth$locality[indicator1_bymonth$presc_location_name == input$locality3],], aes(x = paid_date, y = localitymean, colour = "Locality Mean"))+
+  scale_y_continuous(name = "Antibiotics Items Prescribed Per 1000 List Size")+
+  theme_minimal()
+})
+  
+```
+
+# Indicator 2 - Number of Co-Amoxiclav Items per 1000 List Size per 100 Days ≤ 6.00
+```{r indicator2, echo = F}
+co_amoxiclav <- antibiotics %>% filter(pi_approved_name == "CO-AMOXICLAV")
+
+# Indicator 2 - summarise by financial quarter
+indicator2_byquarter <- co_amoxiclav %>% group_by(locality, cluster, presc_location_code, presc_location_name, practice_population, paid_financial_quarter) %>%
+  summarise(antibiotics_items = sum(number_of_paid_items)) %>%
+  mutate(items_per_1000_listsize = round((antibiotics_items*1000)/practice_population,2),
+         items_per_1000_listsize_per100days = round((items_per_1000_listsize/(365/4)*100),2),
+         target = 6.00,
+         target_met = if_else(items_per_1000_listsize_per100days <= target, "Yes", "No"))
+
+# Indicator 1 - summarise by month
+indicator2_bymonth <- co_amoxiclav %>% group_by(locality, cluster, presc_location_code, presc_location_name, practice_population, paid_financial_quarter, paid_month_year, paid_date) %>%
+  summarise(antibiotics_items = sum(number_of_paid_items)) %>%
+  mutate(items_per_1000_listsize = round((antibiotics_items*1000)/practice_population,2),
+         items_per_1000_listsize_per100days = round((items_per_1000_listsize/(365/12)*100),2),
+         target = 6.00,
+         target_met = if_else(items_per_1000_listsize_per100days <= target, "Yes", "No"))
+
+# Extract baseline figures
+ind2_baseline <- indicator2_byquarter %>% filter(paid_financial_quarter == "Q3 19/20") %>% 
+  select(presc_location_code, presc_location_name, items_per_1000_listsize_per100days)
+ind2_baseline$baseline <- round(ind2_baseline$items_per_1000_listsize_per100days,2)
+ind2_baseline <- ind2_baseline[,c(4,7)]
+
+# Locality means by month
+ind2_localitymeans <- indicator2_bymonth %>% group_by(locality, paid_date, paid_month_year, target) %>%
+  summarise_at(vars(items_per_1000_listsize_per100days), list(localitymean = mean))  %>%
+  mutate(localitymean = round(localitymean, 2))
+
+# Locality means by quarter
+ind2_localitymeans_byquarter <- indicator2_byquarter %>% group_by(locality, paid_financial_quarter, target) %>%
+  summarise_at(vars(items_per_1000_listsize_per100days), list(localitymean = mean))  %>%
+  mutate(localitymean = round(localitymean, 2))
+```
+
+## Table
+```{r echo = F}
+inputPanel(
+  selectInput("ind2_quarter", label = "Select a quarter:",
+              choices = c(indicator2_byquarter$paid_financial_quarter %>% unique())
+                ))
+  DT::renderDataTable({
+    indicator2_byquarter %>% filter(paid_financial_quarter == input$ind2_quarter) %>%
+      select(!c(paid_financial_quarter, items_per_1000_listsize, target)) %>%
+      left_join(ind2_baseline, by = "presc_location_code") %>%
+      # Add columns for practice baseline and % change since baseline
+  mutate(baseline_change = items_per_1000_listsize_per100days - baseline,
+         percentage_change = round(baseline_change / baseline,2)) 
+    }, rownames = F, filter = "top",
+  colnames = c("Locality", "Cluster", "Location Code", "Location Name", "Practice Population", "Items Prescribed", "Items per 1000 List Size Per 100 Days", "Target Met", "Baseline", "Change from Baseline", "Percentage Reduction"),
+    extensions = 'Buttons', options = list(dom = 'Bfrtrip', buttons = c('copy', 'excel','csv', 'pdf'))
+)
+```
+
+## Bar Chart
+### Co-Amoxiclav Items Prescribed by Practice by Quarter 
+```{r echo = F}
+inputPanel(
+# Selector for choosing locality
+  selectInput("ind2_locality", label = "Choose a locality:",
+              choices = c("East Lothian", "Midlothian", "North East Edinburgh", "North West Edinburgh", "South East Edinburgh", "South West Edinburgh", "West Lothian")),
+# Selector for choosing quarter
+  selectInput("ind2_quarter1", label = "Choose a quarter:",
+              choices = c(indicator2_byquarter$paid_financial_quarter %>% unique())
+))
+
+renderPlot({
+  ggplot(indicator2_byquarter[indicator2_byquarter$locality == input$ind2_locality & indicator2_byquarter$paid_financial_quarter == input$ind2_quarter1,])+
+  geom_bar(aes(x = reorder(presc_location_name, items_per_1000_listsize_per100days), y = items_per_1000_listsize_per100days, fill = target_met), stat = "identity")+
+  geom_hline(aes(yintercept = target, linetype = "Target (6.00)"))+
+  geom_hline(aes(yintercept = mean(items_per_1000_listsize_per100days), linetype = "Locality Mean"))+
+  scale_fill_discrete(name = "Target Met?", breaks = c("No", "Yes"))+
+  scale_x_discrete(name = "")+
+  scale_y_continuous(name = "Co-Amoxiclav Items Prescribed Per 1000 List Size")+
+  theme_minimal()+
+  coord_flip()
+})
+```
+
+
+## Trends Over Time
+### Means per Locality by Quarter
+```{r echo = F}
+# Time Series - Overview of All Localities
+ggplot(ind2_localitymeans)+
+  geom_line(aes(x = paid_date, y = localitymean, colour = locality))+
+  geom_hline(aes(yintercept = target))+
+  annotate("text", min(ind2_localitymeans$paid_date), 6.00, vjust = -.5, label = "Target")+
+  scale_y_continuous(name = "Locality Mean")+
+  theme_minimal()
+```
+
+### Table of Locality Means by Quarter
+```{r echo = F}
+inputPanel(
+  selectInput("ind2_quarter2", label = "Select a quarter:",
+              choices = c(ind2_localitymeans_byquarter$paid_financial_quarter %>% unique())
+                ))
+  DT::renderDataTable({
+    ind2_localitymeans_byquarter[ind2_localitymeans_byquarter$paid_financial_quarter == input$ind2_quarter2,]}, rownames = F, filter = "top", 
+             colnames = c("Locality", "Paid Financial Quarter", "Target", "Locality Mean"),
+    extensions = 'Buttons', options = list(dom = 'Bfrtrip', buttons = c('copy', 'excel','csv', 'pdf'))
+)
+
+```
+
+### All Practices Within a Locality Over Time
+```{r echo = F}
+inputPanel(
+# Selector for choosing locality
+  selectInput("ind2_locality2", label = "Choose a locality:",
+              choices = c("East Lothian", "Midlothian", "North East Edinburgh", "North West Edinburgh", "South East Edinburgh", "South West Edinburgh", "West Lothian"))
+)
+
+renderPlot({
+  ggplot(indicator2_bymonth[indicator2_bymonth$locality == input$ind2_locality2,])+
+  geom_line(aes(x = paid_date, y = items_per_1000_listsize_per100days, group = presc_location_name, colour = presc_location_name), alpha = .7)+
+  geom_hline(aes(yintercept = target))+
+  annotate("text", min(ind2_localitymeans$paid_date), 1.64, vjust = -.5, label = "Target")+
+  geom_line(data = ind2_localitymeans[ind2_localitymeans$locality == input$ind2_locality2,], aes(x = paid_date, y = localitymean), colour = "darkred", size = 2)+
+  scale_y_continuous(name = "Co-Amoxiclav Items Prescribed Per 1000 List Size")+
+  theme_minimal()
+})
+```
+
+### Individual Practices Over Time
+```{r echo = F}
+inputPanel(
+# Selector for choosing locality
+  selectInput("ind2_locality3", label = "Choose a Practice:",
+              choices = c(indicator1_bymonth$presc_location_name %>% sort() %>% unique())
+))
+
+renderPlot({
+  ggplot(indicator2_bymonth[indicator2_bymonth$presc_location_name == input$ind2_locality3,])+
+  geom_line(aes(x = paid_date, y = items_per_1000_listsize_per100days, colour = presc_location_name))+
+  geom_hline(aes(yintercept = target))+
+  annotate("text", min(ind2_localitymeans$paid_date), 1.64, vjust = -.5, label = "Target")+
+  geom_line(data = ind2_localitymeans[ind2_localitymeans$locality == indicator2_bymonth$locality[indicator2_bymonth$presc_location_name == input$ind2_locality3],], aes(x = paid_date, y = localitymean, colour = "Locality Mean"))+
+  scale_y_continuous(name = "Co-Amoxiclav Items Prescribed Per 1000 List Size")+
+  theme_minimal()
+})
+  
+```
+
+
+
+This R Markdown document is made interactive using Shiny. Unlike the more traditional workflow of creating static reports, you can now create documents that allow your readers to change the assumptions underlying your analysis and see the results immediately. 
+
+To learn more, see [Interactive Documents](http://rmarkdown.rstudio.com/authoring_shiny.html).
+
+
+
